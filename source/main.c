@@ -7,7 +7,7 @@
 	- @kr105rlz
 */
 
-#define DEBUG_SOCKET 1
+#define DEBUG_SOCKET 0
 
 #include "ps4.h"
 #include "defines.h"
@@ -40,8 +40,8 @@ void payload(struct knote *kn)
 
 	// Patch functions here if required
 
-	// Restore write protection
-	writeCr0(cr0);
+	// Restore write protection (DO NOT FUCKING DO THIS ON 1.76!)
+	//writeCr0(cr0);
 
 	// Resolve creds
 	cred = td->td_proc->p_ucred;
